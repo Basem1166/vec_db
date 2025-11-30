@@ -207,7 +207,7 @@ class VecDB:
 
                     # cosine similarity
                     v_norm = np.linalg.norm(vec)
-                    score = np.dot(vec, query.T).item() / (v_norm * q_norm + 1e-9)
+                    score = np.dot(vec, query.flatten()) / (v_norm * q_norm + 1e-9)
 
                     # keep top-k list very small
                     if len(best_scores) < top_k:
