@@ -149,102 +149,129 @@ class VecDB:
         print("[INDEX] Done.")
 
     # -------------------------------------------------------------------------
-    # 4. RETRIEVAL
+    # 4. RETRIEVAL (Memory-optimized: <50MB RAM)
     # -------------------------------------------------------------------------
     def retrieve(self, query: np.ndarray, top_k=5):
-        # 1. Setup Query
-        query = query.reshape(1, -1).astype(np.float32)
+        query = query.reshape(-1).astype(np.float32)
         q_norm = np.linalg.norm(query)
-        
-        # Constants
-        VEC_BYTES = DIMENSION * 4 
+
         num_records = self._get_num_records()
-        n_probes = 5 if num_records <= 1_000_000 else 10
+        if num_records <= 1_000_000:
+            n_probes = 5
+        else:
+            n_probes = 10
 
-        # --- A. Read Index Metadata ---
+        # Smaller batch size to reduce peak memory (~256KB per batch for vectors)
+        BATCH = 1000
+        # Batch size for reading IDs to avoid loading huge ID arrays
+        ID_BATCH = 5000
+
         with open(self.index_path, "rb") as f:
+            # --- A. Read header ---
             n_clusters = struct.unpack("I", f.read(4))[0]
+            centroids_start = f.tell()
+            table_start = centroids_start + n_clusters * DIMENSION * 4
 
-            # Read Centroids
-            centroid_bytes = f.read(n_clusters * DIMENSION * 4)
-            centroids = np.frombuffer(centroid_bytes, dtype=np.float32) \
-                                   .reshape(n_clusters, DIMENSION)
-
-            # Read Cluster Offset Table
-            table_bytes = f.read(n_clusters * 8)
-            cluster_table = np.frombuffer(table_bytes, dtype=np.int32) \
-                                       .reshape(n_clusters, 2)
-
-            # --- B. Coarse Search (Find best clusters) ---
-            c_norms = np.linalg.norm(centroids, axis=1)
-            dots = np.dot(centroids, query.T).flatten()
-            sims = dots / (c_norms * q_norm + 1e-9)
-            closest_clusters = np.argsort(sims)[::-1][:n_probes]
-
-        # --- C. Fine Search (Low RAM, Batched IO) ---
-        best_scores = []
-        best_ids = []
-
-        # Open DB for reading vectors
-        # buffering is enabled by default (good for performance)
-        with open(self.db_path, "rb") as db_f:
+            # --- B. Coarse search: stream centroids to find closest clusters ---
+            # Process centroids in chunks to avoid loading all at once
+            CENTROID_BATCH = 500
+            cluster_sims = np.empty(n_clusters, dtype=np.float32)
             
-            # Open Index for reading IDs
-            with open(self.index_path, "rb") as fidx:
+            for c_start in range(0, n_clusters, CENTROID_BATCH):
+                c_end = min(c_start + CENTROID_BATCH, n_clusters)
+                c_count = c_end - c_start
                 
-                for cid in closest_clusters:
-                    offset, count = cluster_table[cid]
-                    if count == 0:
-                        continue
+                f.seek(centroids_start + c_start * DIMENSION * 4)
+                chunk_bytes = f.read(c_count * DIMENSION * 4)
+                chunk = np.frombuffer(chunk_bytes, dtype=np.float32).reshape(c_count, DIMENSION)
+                
+                c_norms = np.linalg.norm(chunk, axis=1)
+                dots = np.dot(chunk, query)
+                cluster_sims[c_start:c_end] = dots / (c_norms * q_norm + 1e-9)
+                
+                del chunk, c_norms, dots
+            
+            closest_clusters = np.argpartition(cluster_sims, -n_probes)[-n_probes:]
+            closest_clusters = closest_clusters[np.argsort(cluster_sims[closest_clusters])[::-1]]
+            del cluster_sims
 
-                    # 1. Read IDs for this cluster from Index
-                    fidx.seek(offset)
-                    ids_bytes = fidx.read(count * 4)
-                    row_ids = np.frombuffer(ids_bytes, dtype=np.int32)
+            # --- C. Read only needed entries from offset table ---
+            cluster_info = []
+            for cid in closest_clusters:
+                f.seek(table_start + cid * 8)
+                offset, count = struct.unpack("II", f.read(8))
+                if count > 0:
+                    cluster_info.append((cid, offset, count))
 
-                    # 2. Allocate Buffer for Vectors (Reusable RAM)
-                    #    We process the whole cluster in one numpy batch for speed
-                    cluster_vecs = np.zeros((count, DIMENSION), dtype=np.float32)
+            # --- D. Fine search with streaming ---
+            # Use fixed-size numpy arrays instead of lists for efficiency
+            max_keep = max(10 * top_k, 100)  # Keep a small buffer
+            best_scores = np.full(max_keep, -np.inf, dtype=np.float32)
+            best_ids = np.zeros(max_keep, dtype=np.int32)
+            n_found = 0
 
-                    # 3. Fill Buffer (The IO bottleneck)
-                    for i, rid in enumerate(row_ids):
-                        # Calculate exact byte position
-                        seek_pos = int(rid) * VEC_BYTES
+            # Memory-map DB (this is just a view, doesn't load into RAM)
+            mmap_db = np.memmap(self.db_path, dtype=np.float32, mode='r', 
+                               shape=(num_records, DIMENSION))
+
+            for cid, offset, count in cluster_info:
+                # Stream IDs in smaller chunks to avoid huge allocations
+                for id_start in range(0, count, ID_BATCH):
+                    id_end = min(id_start + ID_BATCH, count)
+                    id_count = id_end - id_start
+                    
+                    # Read only this chunk of IDs
+                    f.seek(offset + id_start * 4)
+                    id_bytes = f.read(id_count * 4)
+                    row_ids = np.frombuffer(id_bytes, dtype=np.int32)
+
+                    # Process vectors in small batches
+                    for i in range(0, len(row_ids), BATCH):
+                        batch_ids = row_ids[i:i+BATCH]
                         
-                        # Move pointer and read directly into numpy array
-                        # readinto is zero-copy (fastest way to read binary in Python)
-                        db_f.seek(seek_pos)
-                        db_f.readinto(cluster_vecs[i])
+                        # Copy vectors to contiguous array (required for non-contiguous memmap access)
+                        vecs = np.empty((len(batch_ids), DIMENSION), dtype=np.float32)
+                        for j, rid in enumerate(batch_ids):
+                            vecs[j] = mmap_db[rid]
 
-                    # 4. Compute Scores (The CPU speedup)
-                    #    Dot product of (Count x 64) vs (64 x 1) -> (Count x 1)
-                    v_norms = np.linalg.norm(cluster_vecs, axis=1)
-                    dots = np.dot(cluster_vecs, query.T).flatten()
-                    batch_sims = dots / (v_norms * q_norm + 1e-9)
+                        # Compute cosine similarity
+                        norms = np.linalg.norm(vecs, axis=1)
+                        dots = np.dot(vecs, query)
+                        sims = dots / (norms * q_norm + 1e-9)
+                        
+                        del vecs, norms, dots
 
-                    # 5. Accumulate Results
-                    best_scores.extend(batch_sims)
-                    best_ids.extend(row_ids)
+                        # Update best results
+                        for j, sim in enumerate(sims):
+                            if n_found < max_keep:
+                                best_scores[n_found] = sim
+                                best_ids[n_found] = batch_ids[j]
+                                n_found += 1
+                            elif sim > best_scores.min():
+                                min_idx = np.argmin(best_scores)
+                                best_scores[min_idx] = sim
+                                best_ids[min_idx] = batch_ids[j]
+                        
+                        del sims
 
-        # --- D. Final Top-K Sort ---
-        if not best_scores:
+                    del row_ids
+
+            del mmap_db
+
+        # --- E. Final top-k selection ---
+        if n_found == 0:
             return []
 
-        best_scores = np.array(best_scores)
-        best_ids = np.array(best_ids)
+        valid_scores = best_scores[:n_found]
+        valid_ids = best_ids[:n_found]
 
-        # Get top k indices
-        if len(best_scores) > top_k:
-            # unsorted top k partition (O(N))
-            idx = np.argpartition(best_scores, -top_k)[-top_k:]
-            # sort only the top k (O(K log K))
-            idx = idx[np.argsort(best_scores[idx])[::-1]]
+        if n_found > top_k:
+            idx = np.argpartition(valid_scores, -top_k)[-top_k:]
+            idx = idx[np.argsort(valid_scores[idx])[::-1]]
         else:
-            idx = np.argsort(best_scores)[::-1]
+            idx = np.argsort(valid_scores)[::-1]
 
-        return best_ids[idx].tolist()
-
-
+        return valid_ids[idx].tolist()
 
 
 
