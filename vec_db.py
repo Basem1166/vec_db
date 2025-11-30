@@ -153,71 +153,101 @@ class VecDB:
     # -------------------------------------------------------------------------
     def retrieve(self, query: np.ndarray, top_k=5):
         query = query.reshape(1, -1).astype(np.float32)
-        
-        num_records = self._get_num_records()
-        if num_records <= 1_000_000: n_probes = 5
-        else: n_probes = 10 
 
-        # --- A. Read Metadata from Index File ---
-        # We read this EVERY time to satisfy "no caching" rule
+        num_records = self._get_num_records()
+        if num_records <= 1_000_000:
+            n_probes = 5
+        else:
+            n_probes = 10
+
+        BATCH = 4000  # ~1MB per batch
+
+        # --- A. Read index metadata (no caching allowed) ---
         with open(self.index_path, "rb") as f:
-            # 1. Read N Clusters
+            # 1. Number of clusters
             n_clusters = struct.unpack("I", f.read(4))[0]
-            
-            # 2. Read Centroids
+
+            # 2. Read centroids
             centroid_bytes = f.read(n_clusters * DIMENSION * 4)
-            centroids = np.frombuffer(centroid_bytes, dtype=np.float32).reshape(n_clusters, DIMENSION)
-            
-            # 3. Read Offset Table (N * 2 ints)
+            centroids = np.frombuffer(centroid_bytes, dtype=np.float32)\
+                         .reshape(n_clusters, DIMENSION)
+
+            # 3. Offset table
             table_bytes = f.read(n_clusters * 8)
-            # shape: (N, 2) where col 0 is offset, col 1 is count
-            cluster_table = np.frombuffer(table_bytes, dtype=np.int32).reshape(n_clusters, 2)
-            
-            # --- B. Coarse Search ---
+            cluster_table = np.frombuffer(table_bytes, dtype=np.int32)\
+                            .reshape(n_clusters, 2)
+
+            # --- B. Coarse search ---
             c_norms = np.linalg.norm(centroids, axis=1)
             q_norm = np.linalg.norm(query)
             dists = np.dot(centroids, query.T).flatten()
-            sims = dists / (c_norms * q_norm + 1e-10)
+            sims = dists / (c_norms * q_norm + 1e-9)
             closest_clusters = np.argsort(sims)[::-1][:n_probes]
-            
-            # --- C. Fine Search ---
-            mmap_vectors = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
-            
-            candidates_scores = []
-            candidates_ids = []
-            
+
+            # --- C. Fine search (streaming batches) ---
+            best_scores = []
+            best_ids = []
+
+            # We memmap DB once (lightweight)
+            mmap_db = np.memmap(
+                self.db_path,
+                dtype=np.float32,
+                mode='r',
+                shape=(num_records, DIMENSION)
+            )
+
             for cid in closest_clusters:
                 offset, count = cluster_table[cid]
-                
-                if count == 0: continue
-                
-                # Jump to list
-                f.seek(offset)
-                
-                # Read IDs
-                ids_bytes = f.read(count * 4)
-                row_ids = np.frombuffer(ids_bytes, dtype=np.int32)
-                
-                # Vectorized Score
-                cluster_vecs = mmap_vectors[row_ids]
-                
-                c_vec_norms = np.linalg.norm(cluster_vecs, axis=1)
-                dot_products = np.dot(cluster_vecs, query.T).flatten()
-                batch_scores = dot_products / (c_vec_norms * q_norm + 1e-10)
-                
-                candidates_scores.extend(batch_scores)
-                candidates_ids.extend(row_ids)
+                if count == 0:
+                    continue
 
-        # --- D. Final Top K ---
-        candidates_scores = np.array(candidates_scores)
-        candidates_ids = np.array(candidates_ids)
-        
-        if len(candidates_scores) == 0: return []
-        
-        if len(candidates_scores) > top_k:
-            top_indices = np.argpartition(candidates_scores, -top_k)[-top_k:]
-            sorted_top_indices = top_indices[np.argsort(candidates_scores[top_indices])[::-1]]
+                # Read ID list
+                f.seek(offset)
+                ids_bytes = f.read(count * 4)
+                row_ids = np.frombuffer(ids_bytes, dtype=np.int32, count=count)
+
+                # Process in small batches
+                for i in range(0, count, BATCH):
+                    batch_ids = row_ids[i:i+BATCH]
+
+                    # Stream vectors from disk; memmap slicing is cheap and lazy
+                    vecs = mmap_db[batch_ids]
+
+                    # Compute cosine similarity
+                    norms = np.linalg.norm(vecs, axis=1)
+                    dots = np.dot(vecs, query.T).flatten()
+                    sims = dots / (norms * q_norm + 1e-9)
+
+                    # Reduce local batch to top_k
+                    if len(sims) > top_k:
+                        local_idx = np.argpartition(sims, -top_k)[-top_k:]
+                    else:
+                        local_idx = np.arange(len(sims))
+
+                    # Add to global buffer
+                    for idx in local_idx:
+                        best_scores.append(sims[idx])
+                        best_ids.append(batch_ids[idx])
+
+                    # Keep global memory small (<5x top_k)
+                    if len(best_scores) > 5 * top_k:
+                        k = np.argpartition(best_scores, -top_k)[-top_k:]
+                        best_scores = [best_scores[j] for j in k]
+                        best_ids = [best_ids[j] for j in k]
+
+        # --- D. Final top-k selection ---
+        if not best_scores:
+            return []
+
+        best_scores = np.array(best_scores)
+        best_ids = np.array(best_ids)
+
+        if len(best_scores) > top_k:
+            idx = np.argpartition(best_scores, -top_k)[-top_k:]
+            idx = idx[np.argsort(best_scores[idx])[::-1]]
         else:
-            sorted_top_indices = np.argsort(candidates_scores)[::-1]
-            
-        return candidates_ids[sorted_top_indices].tolist()
+            idx = np.argsort(best_scores)[::-1]
+
+        return best_ids[idx].tolist()
+
+
