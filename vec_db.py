@@ -156,124 +156,78 @@ class VecDB:
         q_norm = np.linalg.norm(query)
 
         num_records = self._get_num_records()
-        if num_records <= 1_000_000:
-            n_probes = 5
-        else:
-            n_probes = 10
+        if num_records <= 1_000_000: n_probes = 5
+        else: n_probes = 10
 
-        # Smaller batch size to reduce peak memory (~256KB per batch for vectors)
-        BATCH = 1000
-        # Batch size for reading IDs to avoid loading huge ID arrays
-        ID_BATCH = 5000
+        # Use a heap to maintain top-k with minimal memory
+        import heapq
+        top_k_heap = []  # min-heap of (score, id)
 
         with open(self.index_path, "rb") as f:
-            # --- A. Read header ---
+            # 1. Read N Clusters
             n_clusters = struct.unpack("I", f.read(4))[0]
-            centroids_start = f.tell()
-            table_start = centroids_start + n_clusters * DIMENSION * 4
 
-            # --- B. Coarse search: stream centroids to find closest clusters ---
-            # Process centroids in chunks to avoid loading all at once
-            CENTROID_BATCH = 500
-            cluster_sims = np.empty(n_clusters, dtype=np.float32)
-            
-            for c_start in range(0, n_clusters, CENTROID_BATCH):
-                c_end = min(c_start + CENTROID_BATCH, n_clusters)
-                c_count = c_end - c_start
-                
-                f.seek(centroids_start + c_start * DIMENSION * 4)
-                chunk_bytes = f.read(c_count * DIMENSION * 4)
-                chunk = np.frombuffer(chunk_bytes, dtype=np.float32).reshape(c_count, DIMENSION)
-                
-                c_norms = np.linalg.norm(chunk, axis=1)
-                dots = np.dot(chunk, query)
-                cluster_sims[c_start:c_end] = dots / (c_norms * q_norm + 1e-9)
-                
-                del chunk, c_norms, dots
-            
-            closest_clusters = np.argpartition(cluster_sims, -n_probes)[-n_probes:]
-            closest_clusters = closest_clusters[np.argsort(cluster_sims[closest_clusters])[::-1]]
-            del cluster_sims
+            # 2. Read Centroids
+            centroid_bytes = f.read(n_clusters * DIMENSION * 4)
+            centroids = np.frombuffer(centroid_bytes, dtype=np.float32).reshape(n_clusters, DIMENSION)
 
-            # --- C. Read only needed entries from offset table ---
-            cluster_info = []
+            # 3. Read Offset Table (N * 2 ints)
+            table_bytes = f.read(n_clusters * 8)
+            cluster_table = np.frombuffer(table_bytes, dtype=np.int32).reshape(n_clusters, 2)
+
+            # --- B. Coarse Search ---
+            c_norms = np.linalg.norm(centroids, axis=1)
+            dists = np.dot(centroids, query)
+            sims = dists / (c_norms * q_norm + 1e-10)
+            closest_clusters = np.argsort(sims)[::-1][:n_probes]
+
+            # Free centroids from memory
+            del centroids, c_norms, dists, sims
+
+            # --- C. Fine Search (streaming with small batches) ---
+            BATCH_SIZE = 500  # Small batch to minimize RAM
+
             for cid in closest_clusters:
-                f.seek(table_start + cid * 8)
-                offset, count = struct.unpack("II", f.read(8))
-                if count > 0:
-                    cluster_info.append((cid, offset, count))
+                offset, count = int(cluster_table[cid, 0]), int(cluster_table[cid, 1])
+                if count == 0: continue
 
-            # --- D. Fine search with streaming ---
-            # Use fixed-size numpy arrays instead of lists for efficiency
-            max_keep = max(10 * top_k, 100)  # Keep a small buffer
-            best_scores = np.full(max_keep, -np.inf, dtype=np.float32)
-            best_ids = np.zeros(max_keep, dtype=np.int32)
-            n_found = 0
+                f.seek(offset)
+                ids_bytes = f.read(count * 4)
+                row_ids = np.frombuffer(ids_bytes, dtype=np.int32)
 
-            # Memory-map DB (this is just a view, doesn't load into RAM)
-            mmap_db = np.memmap(self.db_path, dtype=np.float32, mode='r', 
-                               shape=(num_records, DIMENSION))
+                # Process in small batches to minimize memory
+                for batch_start in range(0, count, BATCH_SIZE):
+                    batch_end = min(batch_start + BATCH_SIZE, count)
+                    batch_ids = row_ids[batch_start:batch_end]
 
-            for cid, offset, count in cluster_info:
-                # Stream IDs in smaller chunks to avoid huge allocations
-                for id_start in range(0, count, ID_BATCH):
-                    id_end = min(id_start + ID_BATCH, count)
-                    id_count = id_end - id_start
-                    
-                    # Read only this chunk of IDs
-                    f.seek(offset + id_start * 4)
-                    id_bytes = f.read(id_count * 4)
-                    row_ids = np.frombuffer(id_bytes, dtype=np.int32)
+                    # Read vectors one batch at a time directly from file
+                    batch_vecs = np.empty((len(batch_ids), DIMENSION), dtype=np.float32)
+                    for i, rid in enumerate(batch_ids):
+                        vec_offset = int(rid) * DIMENSION * ELEMENT_SIZE
+                        with open(self.db_path, "rb") as db_f:
+                            db_f.seek(vec_offset)
+                            batch_vecs[i] = np.frombuffer(db_f.read(DIMENSION * 4), dtype=np.float32)
 
-                    # Process vectors in small batches
-                    for i in range(0, len(row_ids), BATCH):
-                        batch_ids = row_ids[i:i+BATCH]
-                        
-                        # Copy vectors to contiguous array (required for non-contiguous memmap access)
-                        vecs = np.empty((len(batch_ids), DIMENSION), dtype=np.float32)
-                        for j, rid in enumerate(batch_ids):
-                            vecs[j] = mmap_db[rid]
+                    # Compute scores for this batch
+                    vec_norms = np.linalg.norm(batch_vecs, axis=1)
+                    dot_products = np.dot(batch_vecs, query)
+                    scores = dot_products / (vec_norms * q_norm + 1e-10)
 
-                        # Compute cosine similarity
-                        norms = np.linalg.norm(vecs, axis=1)
-                        dots = np.dot(vecs, query)
-                        sims = dots / (norms * q_norm + 1e-9)
-                        
-                        del vecs, norms, dots
+                    # Update heap with top-k
+                    for idx, score in enumerate(scores):
+                        if len(top_k_heap) < top_k:
+                            heapq.heappush(top_k_heap, (score, int(batch_ids[idx])))
+                        elif score > top_k_heap[0][0]:
+                            heapq.heapreplace(top_k_heap, (score, int(batch_ids[idx])))
 
-                        # Update best results
-                        for j, sim in enumerate(sims):
-                            if n_found < max_keep:
-                                best_scores[n_found] = sim
-                                best_ids[n_found] = batch_ids[j]
-                                n_found += 1
-                            elif sim > best_scores.min():
-                                min_idx = np.argmin(best_scores)
-                                best_scores[min_idx] = sim
-                                best_ids[min_idx] = batch_ids[j]
-                        
-                        del sims
+                    del batch_vecs, vec_norms, dot_products, scores
 
-                    del row_ids
-
-            del mmap_db
-
-        # --- E. Final top-k selection ---
-        if n_found == 0:
+        # --- D. Return sorted top-k ---
+        if not top_k_heap:
             return []
-
-        valid_scores = best_scores[:n_found]
-        valid_ids = best_ids[:n_found]
-
-        if n_found > top_k:
-            idx = np.argpartition(valid_scores, -top_k)[-top_k:]
-            idx = idx[np.argsort(valid_scores[idx])[::-1]]
-        else:
-            idx = np.argsort(valid_scores)[::-1]
-
-        return valid_ids[idx].tolist()
-
-
+        
+        result = sorted(top_k_heap, key=lambda x: -x[0])
+        return [item[1] for item in result]
 
 
 
