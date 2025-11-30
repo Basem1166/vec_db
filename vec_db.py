@@ -152,76 +152,97 @@ class VecDB:
     # 4. RETRIEVAL
     # -------------------------------------------------------------------------
     def retrieve(self, query: np.ndarray, top_k=5):
+        # 1. Setup Query
         query = query.reshape(1, -1).astype(np.float32)
         q_norm = np.linalg.norm(query)
-        VEC_BYTES = DIMENSION * 4
-        CANDIDATE_MULTIPLIER = 5  # allow 5x top_k in memory
-
+        
+        # Constants
+        VEC_BYTES = DIMENSION * 4 
         num_records = self._get_num_records()
         n_probes = 5 if num_records <= 1_000_000 else 10
 
-        # --- A. Read index metadata ---
+        # --- A. Read Index Metadata ---
         with open(self.index_path, "rb") as f:
             n_clusters = struct.unpack("I", f.read(4))[0]
 
+            # Read Centroids
             centroid_bytes = f.read(n_clusters * DIMENSION * 4)
-            centroids = np.frombuffer(centroid_bytes, dtype=np.float32).reshape(n_clusters, DIMENSION)
+            centroids = np.frombuffer(centroid_bytes, dtype=np.float32) \
+                                   .reshape(n_clusters, DIMENSION)
 
+            # Read Cluster Offset Table
             table_bytes = f.read(n_clusters * 8)
-            cluster_table = np.frombuffer(table_bytes, dtype=np.int32).reshape(n_clusters, 2)
+            cluster_table = np.frombuffer(table_bytes, dtype=np.int32) \
+                                       .reshape(n_clusters, 2)
 
-            # --- B. Coarse search ---
+            # --- B. Coarse Search (Find best clusters) ---
             c_norms = np.linalg.norm(centroids, axis=1)
             dots = np.dot(centroids, query.T).flatten()
             sims = dots / (c_norms * q_norm + 1e-9)
             closest_clusters = np.argsort(sims)[::-1][:n_probes]
 
-        # --- C. Fine search (streaming, buffered top candidates) ---
-        candidate_scores = []
-        candidate_ids = []
+        # --- C. Fine Search (Low RAM, Batched IO) ---
+        best_scores = []
+        best_ids = []
 
-        with open(self.db_path, "rb", buffering=0) as dbf:  # unbuffered for fast seeks
-            for cid in closest_clusters:
-                offset, count = cluster_table[cid]
-                if count == 0:
-                    continue
+        # Open DB for reading vectors
+        # buffering is enabled by default (good for performance)
+        with open(self.db_path, "rb") as db_f:
+            
+            # Open Index for reading IDs
+            with open(self.index_path, "rb") as fidx:
+                
+                for cid in closest_clusters:
+                    offset, count = cluster_table[cid]
+                    if count == 0:
+                        continue
 
-                with open(self.index_path, "rb") as fidx:
+                    # 1. Read IDs for this cluster from Index
                     fidx.seek(offset)
                     ids_bytes = fidx.read(count * 4)
-                    row_ids = np.frombuffer(ids_bytes, dtype=np.int32, count=count)
+                    row_ids = np.frombuffer(ids_bytes, dtype=np.int32)
 
-                # --- Stream vectors one by one ---
-                for rid in row_ids:
-                    pos = int(rid) * VEC_BYTES
-                    os.lseek(dbf.fileno(), pos, os.SEEK_SET)
-                    raw = dbf.read(VEC_BYTES)
-                    vec = np.frombuffer(raw, dtype=np.float32)
+                    # 2. Allocate Buffer for Vectors (Reusable RAM)
+                    #    We process the whole cluster in one numpy batch for speed
+                    cluster_vecs = np.zeros((count, DIMENSION), dtype=np.float32)
 
-                    # cosine similarity
-                    v_norm = np.linalg.norm(vec)
-                    score = np.dot(vec, query.flatten()) / (v_norm * q_norm + 1e-9)
+                    # 3. Fill Buffer (The IO bottleneck)
+                    for i, rid in enumerate(row_ids):
+                        # Calculate exact byte position
+                        seek_pos = int(rid) * VEC_BYTES
+                        
+                        # Move pointer and read directly into numpy array
+                        # readinto is zero-copy (fastest way to read binary in Python)
+                        db_f.seek(seek_pos)
+                        db_f.readinto(cluster_vecs[i])
 
-                    candidate_scores.append(score)
-                    candidate_ids.append(int(rid))
+                    # 4. Compute Scores (The CPU speedup)
+                    #    Dot product of (Count x 64) vs (64 x 1) -> (Count x 1)
+                    v_norms = np.linalg.norm(cluster_vecs, axis=1)
+                    dots = np.dot(cluster_vecs, query.T).flatten()
+                    batch_sims = dots / (v_norms * q_norm + 1e-9)
 
-                    # prune occasionally to keep memory small
-                    if len(candidate_scores) > CANDIDATE_MULTIPLIER * top_k:
-                        k = np.argpartition(candidate_scores, -top_k)[-top_k:]
-                        candidate_scores = [candidate_scores[j] for j in k]
-                        candidate_ids = [candidate_ids[j] for j in k]
+                    # 5. Accumulate Results
+                    best_scores.extend(batch_sims)
+                    best_ids.extend(row_ids)
 
-        # --- D. Final top-k selection ---
-        if not candidate_scores:
+        # --- D. Final Top-K Sort ---
+        if not best_scores:
             return []
 
-        if len(candidate_scores) > top_k:
-            k = np.argpartition(candidate_scores, -top_k)[-top_k:]
-            candidate_scores = [candidate_scores[j] for j in k]
-            candidate_ids = [candidate_ids[j] for j in k]
+        best_scores = np.array(best_scores)
+        best_ids = np.array(best_ids)
 
-        order = np.argsort(candidate_scores)[::-1]
-        return [candidate_ids[i] for i in order]
+        # Get top k indices
+        if len(best_scores) > top_k:
+            # unsorted top k partition (O(N))
+            idx = np.argpartition(best_scores, -top_k)[-top_k:]
+            # sort only the top k (O(K log K))
+            idx = idx[np.argsort(best_scores[idx])[::-1]]
+        else:
+            idx = np.argsort(best_scores)[::-1]
+
+        return best_ids[idx].tolist()
 
 
 
