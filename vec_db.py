@@ -196,9 +196,8 @@ class VecDB:
                 # --- Stream vectors one by one ---
                 for rid in row_ids:
                     # seek to vector position
+                    rid = int(rid)  # convert numpy.int32 to Python int
                     pos = rid * VEC_BYTES
-                    print("rid:", rid, "VEC_BYTES:", VEC_BYTES, "pos:", pos)
-                    print("vec file size:", os.path.getsize(self.vec_file))
                     os.lseek(dbf.fileno(), pos, os.SEEK_SET)
                     raw = dbf.read(VEC_BYTES)
 
@@ -224,6 +223,7 @@ class VecDB:
         # --- D. Final sorting ---
         order = np.argsort(best_scores)[::-1]
         return [best_ids[i] for i in order]
+
 
 
 
