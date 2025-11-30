@@ -199,7 +199,6 @@ class VecDB:
                     rid = int(rid)
                     pos = rid * VEC_BYTES
                     os.lseek(dbf.fileno(), pos, os.SEEK_SET)
-                    raw = dbf.read(VEC_BYTES)
 
 
                     # read 64 floats (256 bytes)
