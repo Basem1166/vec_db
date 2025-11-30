@@ -151,56 +151,79 @@ class VecDB:
     # -------------------------------------------------------------------------
     # 4. RETRIEVAL
     # -------------------------------------------------------------------------
-    def retrieve(self, query, top_k):
-        # compute query hash code
-        query_code = self.compute_hash(query)
-    
-        # get candidate row IDs from hash buckets
-        row_ids = self.hash_table.get(query_code, [])
-    
-        # if no matches in bucket
-        if not row_ids:
-            return []
-    
-        VEC_BYTES = self.vec_dim * 4  # float32
-    
-        distances = []
-    
-        # open vector file
-        with open(self.vec_file, "rb") as dbf:
-            for rid in row_ids:
-    
-                # ensure Python int to avoid numpy int32 overflow
-                rid = int(rid)
-    
-                # bounds check to prevent invalid lseek()
-                if rid < 0 or rid >= self.num_vectors:
-                    # This SHOULD NEVER HAPPEN — but if it does,
-                    # it means your index stored corrupted row IDs.
-                    print(f"[ERROR] Invalid rid={rid} (valid range 0..{self.num_vectors-1})")
+    def retrieve(self, query: np.ndarray, top_k=5):
+        query = query.reshape(1, -1).astype(np.float32)
+        q_norm = np.linalg.norm(query)
+
+        VEC_BYTES = DIMENSION * 4
+
+        num_records = self._get_num_records()
+        n_probes = 5 if num_records <= 1_000_000 else 10
+
+        # --- A. Read index metadata ---
+        with open(self.index_path, "rb") as f:
+            n_clusters = struct.unpack("I", f.read(4))[0]
+
+            centroid_bytes = f.read(n_clusters * DIMENSION * 4)
+            centroids = np.frombuffer(centroid_bytes, dtype=np.float32) \
+                        .reshape(n_clusters, DIMENSION)
+
+            table_bytes = f.read(n_clusters * 8)
+            cluster_table = np.frombuffer(table_bytes, dtype=np.int32) \
+                            .reshape(n_clusters, 2)
+
+            # --- B. Coarse search ---
+            c_norms = np.linalg.norm(centroids, axis=1)
+            dots = np.dot(centroids, query.T).flatten()
+            sims = dots / (c_norms * q_norm + 1e-9)
+            closest_clusters = np.argsort(sims)[::-1][:n_probes]
+
+        # --- C. Fine search (true streaming, no memmap indexing) ---
+        best_scores = []
+        best_ids = []
+
+        with open(self.db_path, "rb", buffering=0) as dbf:   # unbuffered (fast seeks)
+            for cid in closest_clusters:
+                offset, count = cluster_table[cid]
+                if count == 0:
                     continue
-    
-                pos = rid * VEC_BYTES
-    
-                # extra safety: ensure position is within file
-                if pos < 0 or pos + VEC_BYTES > self.vec_file_size:
-                    print(f"[ERROR] Invalid file seek position pos={pos}, rid={rid}")
-                    continue
-    
-                # seek to correct vector location
-                os.lseek(dbf.fileno(), pos, os.SEEK_SET)
-    
-                # read vector bytes
-                raw = dbf.read(VEC_BYTES)
-                vec = np.frombuffer(raw, dtype=np.float32)
-    
-                # compute L2 distance
-                dist = np.dot(query - vec, query - vec)
-                distances.append((dist, rid))
-    
-        # get top K by smallest distance
-        distances.sort(key=lambda x: x[0])
-        return [rid for _, rid in distances[:top_k]]
+
+                with open(self.index_path, "rb") as fidx:
+                    fidx.seek(offset)
+                    ids_bytes = fidx.read(count * 4)
+                    row_ids = np.frombuffer(ids_bytes, dtype=np.int32, count=count)
+
+                # --- Stream vectors one by one ---
+                for rid in row_ids:
+                    # seek to vector position
+                    pos = rid * VEC_BYTES
+                    print("rid:", rid, "VEC_BYTES:", VEC_BYTES, "pos:", pos)
+                    print("vec file size:", os.path.getsize(self.vec_file))
+                    os.lseek(dbf.fileno(), pos, os.SEEK_SET)
+                    raw = dbf.read(VEC_BYTES)
+
+
+                    # read 64 floats (256 bytes)
+                    raw = dbf.read(VEC_BYTES)
+                    vec = np.frombuffer(raw, dtype=np.float32)
+
+                    # cosine similarity
+                    v_norm = np.linalg.norm(vec)
+                    score = np.dot(vec, query.T).item() / (v_norm * q_norm + 1e-9)
+
+                    # keep top-k list very small
+                    if len(best_scores) < top_k:
+                        best_scores.append(score)
+                        best_ids.append(rid)
+                    else:
+                        min_idx = np.argmin(best_scores)
+                        if score > best_scores[min_idx]:
+                            best_scores[min_idx] = score
+                            best_ids[min_idx] = rid
+
+        # --- D. Final sorting ---
+        order = np.argsort(best_scores)[::-1]
+        return [best_ids[i] for i in order]
 
 
 
