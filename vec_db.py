@@ -148,81 +148,76 @@ class VecDB:
 
         print("[INDEX] Done.")
 
-
-        # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # 4. RETRIEVAL
     # -------------------------------------------------------------------------
     def retrieve(self, query: np.ndarray, top_k=5):
         query = query.reshape(1, -1).astype(np.float32)
-
+        
         num_records = self._get_num_records()
         if num_records <= 1_000_000: n_probes = 5
-        else: n_probes = 10
+        else: n_probes = 10 
 
         # --- A. Read Metadata from Index File ---
         # We read this EVERY time to satisfy "no caching" rule
         with open(self.index_path, "rb") as f:
             # 1. Read N Clusters
             n_clusters = struct.unpack("I", f.read(4))[0]
-
+            
             # 2. Read Centroids
             centroid_bytes = f.read(n_clusters * DIMENSION * 4)
             centroids = np.frombuffer(centroid_bytes, dtype=np.float32).reshape(n_clusters, DIMENSION)
-
+            
             # 3. Read Offset Table (N * 2 ints)
             table_bytes = f.read(n_clusters * 8)
             # shape: (N, 2) where col 0 is offset, col 1 is count
             cluster_table = np.frombuffer(table_bytes, dtype=np.int32).reshape(n_clusters, 2)
-
+            
             # --- B. Coarse Search ---
             c_norms = np.linalg.norm(centroids, axis=1)
             q_norm = np.linalg.norm(query)
             dists = np.dot(centroids, query.T).flatten()
             sims = dists / (c_norms * q_norm + 1e-10)
             closest_clusters = np.argsort(sims)[::-1][:n_probes]
-
+            
             # --- C. Fine Search ---
             mmap_vectors = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
-
+            
             candidates_scores = []
             candidates_ids = []
-
+            
             for cid in closest_clusters:
                 offset, count = cluster_table[cid]
-
+                
                 if count == 0: continue
-
+                
                 # Jump to list
                 f.seek(offset)
-
+                
                 # Read IDs
                 ids_bytes = f.read(count * 4)
                 row_ids = np.frombuffer(ids_bytes, dtype=np.int32)
-
+                
                 # Vectorized Score
                 cluster_vecs = mmap_vectors[row_ids]
-
+                
                 c_vec_norms = np.linalg.norm(cluster_vecs, axis=1)
                 dot_products = np.dot(cluster_vecs, query.T).flatten()
                 batch_scores = dot_products / (c_vec_norms * q_norm + 1e-10)
-
+                
                 candidates_scores.extend(batch_scores)
                 candidates_ids.extend(row_ids)
 
         # --- D. Final Top K ---
         candidates_scores = np.array(candidates_scores)
         candidates_ids = np.array(candidates_ids)
-
+        
         if len(candidates_scores) == 0: return []
-
+        
         if len(candidates_scores) > top_k:
             top_indices = np.argpartition(candidates_scores, -top_k)[-top_k:]
             sorted_top_indices = top_indices[np.argsort(candidates_scores[top_indices])[::-1]]
         else:
             sorted_top_indices = np.argsort(candidates_scores)[::-1]
-
+            
         return candidates_ids[sorted_top_indices].tolist()
-
-
-
-
