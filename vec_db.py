@@ -152,80 +152,78 @@ class VecDB:
     # 4. RETRIEVAL
     # -------------------------------------------------------------------------
     def retrieve(self, query: np.ndarray, top_k=5):
-        # 1. Setup
         query = query.reshape(1, -1).astype(np.float32)
         q_norm = np.linalg.norm(query)
-        
-        num_records = self._get_num_records()
-        if num_records <= 1_000_000: n_probes = 5
-        else: n_probes = 10 
 
-        # --- A. Read Metadata ---
+        VEC_BYTES = DIMENSION * 4
+
+        num_records = self._get_num_records()
+        n_probes = 5 if num_records <= 1_000_000 else 10
+
+        # --- A. Read index metadata ---
         with open(self.index_path, "rb") as f:
             n_clusters = struct.unpack("I", f.read(4))[0]
-            
+
             centroid_bytes = f.read(n_clusters * DIMENSION * 4)
-            centroids = np.frombuffer(centroid_bytes, dtype=np.float32).reshape(n_clusters, DIMENSION)
-            
+            centroids = np.frombuffer(centroid_bytes, dtype=np.float32) \
+                        .reshape(n_clusters, DIMENSION)
+
             table_bytes = f.read(n_clusters * 8)
-            cluster_table = np.frombuffer(table_bytes, dtype=np.int32).reshape(n_clusters, 2)
-            
-            # --- B. Coarse Search ---
+            cluster_table = np.frombuffer(table_bytes, dtype=np.int32) \
+                            .reshape(n_clusters, 2)
+
+            # --- B. Coarse search ---
             c_norms = np.linalg.norm(centroids, axis=1)
-            dists = np.dot(centroids, query.T).flatten()
-            sims = dists / (c_norms * q_norm + 1e-9)
+            dots = np.dot(centroids, query.T).flatten()
+            sims = dots / (c_norms * q_norm + 1e-9)
             closest_clusters = np.argsort(sims)[::-1][:n_probes]
 
-            # --- C. Fine Search (Manual Seek - Low RAM) ---
-            candidates_scores = []
-            candidates_ids = []
-            
-            # Open DB in binary read mode (Standard buffering is fine and safer here)
-            with open(self.db_path, "rb") as db_f:
-                for cid in closest_clusters:
-                    offset, count = cluster_table[cid]
-                    if count == 0: continue
-                    
-                    # Read IDs for this cluster from Index
-                    f.seek(offset)
-                    ids_bytes = f.read(count * 4)
-                    row_ids = np.frombuffer(ids_bytes, dtype=np.int32)
-                    
-                    # Iterate IDs and read vectors manually from DB
-                    for rid in row_ids:
-                        # Force Python int to avoid numpy int32 overflow
-                        rid_safe = int(rid)
-                        
-                        # Calculate Byte Position (Vector Index * 64 floats * 4 bytes)
-                        pos = rid_safe * DIMENSION * 4
-                        
-                        # CORRECT WAY: Use file object seek, NOT os.lseek
-                        db_f.seek(pos)
-                        
-                        # Read exactly one vector (256 bytes)
-                        vec_bytes = db_f.read(DIMENSION * 4)
-                        vec = np.frombuffer(vec_bytes, dtype=np.float32)
-                        
-                        # Calculate Score
-                        v_norm = np.linalg.norm(vec)
-                        score = np.dot(vec, query.flatten()) / (v_norm * q_norm + 1e-9)
-                        
-                        candidates_scores.append(score)
-                        candidates_ids.append(rid_safe)
+        # --- C. Fine search (true streaming, no memmap indexing) ---
+        best_scores = []
+        best_ids = []
 
-        # --- D. Final Top K ---
-        candidates_scores = np.array(candidates_scores)
-        candidates_ids = np.array(candidates_ids)
-        
-        if len(candidates_scores) == 0: return []
-        
-        if len(candidates_scores) > top_k:
-            top_indices = np.argpartition(candidates_scores, -top_k)[-top_k:]
-            sorted_top_indices = top_indices[np.argsort(candidates_scores[top_indices])[::-1]]
-        else:
-            sorted_top_indices = np.argsort(candidates_scores)[::-1]
-            
-        return candidates_ids[sorted_top_indices].tolist()
+        with open(self.db_path, "rb", buffering=0) as dbf:   # unbuffered (fast seeks)
+            for cid in closest_clusters:
+                offset, count = cluster_table[cid]
+                if count == 0:
+                    continue
+
+                with open(self.index_path, "rb") as fidx:
+                    fidx.seek(offset)
+                    ids_bytes = fidx.read(count * 4)
+                    row_ids = np.frombuffer(ids_bytes, dtype=np.int32, count=count)
+
+                # --- Stream vectors one by one ---
+                for rid in row_ids:
+                    # seek to vector position
+                    rid = int(rid)
+                    pos = rid * VEC_BYTES
+                    os.lseek(dbf.fileno(), pos, os.SEEK_SET)
+
+
+                    # read 64 floats (256 bytes)
+                    raw = dbf.read(VEC_BYTES)
+                    vec = np.frombuffer(raw, dtype=np.float32)
+
+                    # cosine similarity
+                    v_norm = np.linalg.norm(vec)
+                    score = np.dot(vec, query.flatten()) / (v_norm * q_norm + 1e-9)
+
+
+                    # keep top-k list very small
+                    if len(best_scores) < top_k:
+                        best_scores.append(score)
+                        best_ids.append(rid)
+                    else:
+                        min_idx = np.argmin(best_scores)
+                        if score > best_scores[min_idx]:
+                            best_scores[min_idx] = score
+                            best_ids[min_idx] = rid
+
+        # --- D. Final sorting ---
+        order = np.argsort(best_scores)[::-1]
+        return [best_ids[i] for i in order]
+
 
 
 
