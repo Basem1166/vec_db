@@ -196,6 +196,7 @@ class VecDB:
                 # --- Stream vectors one by one ---
                 for rid in row_ids:
                     # seek to vector position
+                    rid = int(rid)
                     pos = rid * VEC_BYTES
                     print("rid:", rid, "VEC_BYTES:", VEC_BYTES, "pos:", pos)
                     os.lseek(dbf.fileno(), pos, os.SEEK_SET)
